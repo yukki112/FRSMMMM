@@ -5,14 +5,46 @@ header('X-Content-Type-Options: nosniff');
 header('X-Frame-Options: DENY');
 header('X-XSS-Protection: 1; mode=block');
 header('Referrer-Policy: strict-origin-when-cross-origin');
-header('Content-Security-Policy: default-src \'self\'; script-src \'self\' \'unsafe-inline\' https://cdnjs.cloudflare.com https://fonts.googleapis.com; style-src \'self\' \'unsafe-inline\' https://cdnjs.cloudflare.com https://fonts.googleapis.com; img-src \'self\' data: https:; connect-src \'self\'');
+header('Content-Security-Policy: default-src \'self\'; script-src \'self\' \'unsafe-inline\' https://cdnjs.cloudflare.com https://fonts.googleapis.com https://www.google.com https://www.gstatic.com; style-src \'self\' \'unsafe-inline\' https://cdnjs.cloudflare.com https://fonts.googleapis.com; img-src \'self\' data: https:; connect-src \'self\' https://www.google.com');
 
 // Generate CSRF token for session
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
 }
 
+// Generate form submission token
+if (empty($_SESSION['form_token'])) {
+    $_SESSION['form_token'] = bin2hex(random_bytes(16));
+}
+
 require_once 'config/db_connection.php';
+
+// reCAPTCHA Configuration
+define('RECAPTCHA_SITE_KEY', '6LeQlBwsAAAAAKywP_A_cqje5Y8-ahpimuGL-YnV');
+define('RECAPTCHA_SECRET_KEY', '6LeQlBwsAAAAAHx_NsE6gs0-OKjeRQSc5BeWKl0W');
+
+function verifyRecaptcha($token) {
+    $url = 'https://www.google.com/recaptcha/api/siteverify';
+    $data = [
+        'secret' => RECAPTCHA_SECRET_KEY,
+        'response' => $token,
+        'remoteip' => $_SERVER['REMOTE_ADDR']
+    ];
+    
+    $options = [
+        'http' => [
+            'header' => "Content-type: application/x-www-form-urlencoded\r\n",
+            'method' => 'POST',
+            'content' => http_build_query($data)
+        ]
+    ];
+    
+    $context = stream_context_create($options);
+    $result = file_get_contents($url, false, $context);
+    $response = json_decode($result);
+    
+    return $response->success;
+}
 
 function checkRateLimit($identifier, $max_attempts = 5, $time_window = 3600) {
     $rate_file = sys_get_temp_dir() . '/' . md5($identifier) . '.txt';
@@ -31,10 +63,19 @@ function checkRateLimit($identifier, $max_attempts = 5, $time_window = 3600) {
         }
         file_put_contents($rate_file, json_encode($data));
     } else {
-        file_put_contents($rate_file, json_encode(['first_attempt' => time(), 'attempts' => 1]));
+        file_put_contents($rate_file, json_encode(['first_attempt' => $now, 'attempts' => 1]));
     }
     
     return true;
+}
+
+function validateFormToken($token) {
+    return isset($_SESSION['form_token']) && hash_equals($_SESSION['form_token'], $token);
+}
+
+function generateNewFormToken() {
+    $_SESSION['form_token'] = bin2hex(random_bytes(16));
+    return $_SESSION['form_token'];
 }
 
 // Check if volunteer registration is open
@@ -58,13 +99,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $id_back_photo = null;
     
     try {
-        if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-            throw new Exception("Security validation failed. Please try again.");
+        // Enhanced security checks
+        if (!isset($_POST['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+            throw new Exception("Security validation failed. Please refresh the page and try again.");
+        }
+
+        if (!isset($_POST['form_token']) || !validateFormToken($_POST['form_token'])) {
+            throw new Exception("Form session expired. Please refresh the page and try again.");
+        }
+
+        // Verify reCAPTCHA
+        if (!isset($_POST['g-recaptcha-response']) || empty($_POST['g-recaptcha-response'])) {
+            throw new Exception("Please complete the reCAPTCHA verification.");
+        }
+
+        if (!verifyRecaptcha($_POST['g-recaptcha-response'])) {
+            throw new Exception("reCAPTCHA verification failed. Please try again.");
         }
 
         $client_ip = $_SERVER['REMOTE_ADDR'];
-        if (!checkRateLimit($client_ip)) {
-            throw new Exception("Too many submission attempts. Please try again later.");
+        if (!checkRateLimit($client_ip . '_form', 3, 900)) { // 3 attempts per 15 minutes
+            throw new Exception("Too many submission attempts. Please try again in 15 minutes.");
+        }
+
+        // Check for honeypot field
+        if (!empty($_POST['website'])) {
+            throw new Exception("Invalid form submission.");
         }
 
         $email = filter_var(trim($_POST['email'] ?? ''), FILTER_SANITIZE_EMAIL);
@@ -73,10 +133,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             throw new Exception("Please enter a valid email address.");
         }
 
+        // Enhanced email domain validation
         $email_domain = strtolower(substr(strrchr($email, "@"), 1));
-        $blocked_domains = ['tempmail.com', '10minutemail.com', 'guerrillamail.com', 'mailinator.com'];
+        $blocked_domains = [
+            'tempmail.com', '10minutemail.com', 'guerrillamail.com', 'mailinator.com',
+            'yopmail.com', 'throwawaymail.com', 'fakeinbox.com', 'temp-mail.org',
+            'trashmail.com', 'disposablemail.com', 'getairmail.com', 'maildrop.cc'
+        ];
         if (in_array($email_domain, $blocked_domains)) {
-            throw new Exception("Please use a permanent email address.");
+            throw new Exception("Please use a permanent email address from a trusted provider.");
+        }
+
+        // Rate limiting per email
+        if (!checkRateLimit($email . '_email', 2, 3600)) {
+            throw new Exception("This email has been used too many times. Please use a different email or try again later.");
         }
 
         $email_check_query = "SELECT id FROM volunteers WHERE email = ? LIMIT 1";
@@ -89,11 +159,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         // Personal Information - Enhanced sanitization
         $full_name = preg_replace('/[^a-zA-Z\s\'-]/', '', trim($_POST['full_name'] ?? ''));
+        if (strlen($full_name) < 2 || strlen($full_name) > 100) {
+            throw new Exception("Please enter a valid full name (2-100 characters).");
+        }
+
         $date_of_birth = trim($_POST['date_of_birth'] ?? '');
+        $min_age_date = date('Y-m-d', strtotime('-18 years'));
+        if ($date_of_birth > $min_age_date) {
+            throw new Exception("You must be at least 18 years old to volunteer.");
+        }
+
         $gender = in_array($_POST['gender'] ?? '', ['Male', 'Female', 'Other']) ? trim($_POST['gender']) : '';
         $civil_status = in_array($_POST['civil_status'] ?? '', ['Single', 'Married', 'Divorced', 'Widowed']) ? trim($_POST['civil_status']) : '';
+        
         $address = htmlspecialchars(trim($_POST['address'] ?? ''), ENT_QUOTES, 'UTF-8');
+        if (strlen($address) < 10) {
+            throw new Exception("Please provide a complete address.");
+        }
+
         $contact_number = preg_replace('/[^0-9+\-\s]/', '', trim($_POST['contact_number'] ?? ''));
+        if (strlen($contact_number) < 10) {
+            throw new Exception("Please provide a valid contact number.");
+        }
+
         $social_media = htmlspecialchars(trim($_POST['social_media'] ?? ''), ENT_QUOTES, 'UTF-8');
         $valid_id_type = htmlspecialchars(trim($_POST['valid_id_type'] ?? ''), ENT_QUOTES, 'UTF-8');
         $valid_id_number = preg_replace('/[^a-zA-Z0-9\-]/', '', trim($_POST['valid_id_number'] ?? ''));
@@ -176,6 +264,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $volunteered_before = in_array($_POST['volunteered_before'] ?? '', ['Yes', 'No']) ? trim($_POST['volunteered_before']) : '';
         $previous_volunteer_experience = htmlspecialchars(trim($_POST['previous_volunteer_experience'] ?? ''), ENT_QUOTES, 'UTF-8');
         $volunteer_motivation = htmlspecialchars(trim($_POST['volunteer_motivation'] ?? ''), ENT_QUOTES, 'UTF-8');
+        if (strlen($volunteer_motivation) < 20) {
+            throw new Exception("Please provide a more detailed motivation statement (minimum 20 characters).");
+        }
+
         $currently_employed = in_array($_POST['currently_employed'] ?? '', ['Yes', 'No']) ? trim($_POST['currently_employed']) : '';
         $occupation = htmlspecialchars(trim($_POST['occupation'] ?? ''), ENT_QUOTES, 'UTF-8');
         $company = htmlspecialchars(trim($_POST['company'] ?? ''), ENT_QUOTES, 'UTF-8');
@@ -246,6 +338,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         if (empty($signature)) {
             throw new Exception("Please provide your signature by typing your full name.");
+        }
+
+        if ($full_name !== $signature) {
+            throw new Exception("Signature must match your full name exactly.");
         }
 
         // CORRECT SQL QUERY - Exactly 49 parameters
@@ -321,6 +417,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             throw new Exception("Database insertion failed. Please try again.");
         }
         
+        // Generate new form token after successful submission
+        generateNewFormToken();
+        
         $success_message = "Your volunteer application has been submitted successfully! We will review your application and contact you soon.";
         $show_redirect = true;
         
@@ -335,6 +434,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 }
+
+// Generate new form token for the form
+$current_form_token = $_SESSION['form_token'];
 ?>
 
 <!DOCTYPE html>
@@ -345,6 +447,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <title>Volunteer Application - Barangay Commonwealth Fire & Rescue</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" integrity="sha512-1ycn6IcaQQ40/MKBW2a4L+S3Hh8y8zMnRLFvDteIm2i+rSJqLh7MZ5QlsN56KwswusTRz0ECYp5wo8o+MnWVrA==" crossorigin="anonymous" referrerpolicy="no-referrer">
     <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
     <style>
         /* Modern, Professional Design System */
         :root {
@@ -556,6 +659,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             border-color: var(--primary-red);
             box-shadow: 0 0 0 4px rgba(220, 38, 38, 0.1);
             background: var(--bg-white);
+        }
+
+        /* Honeypot field */
+        .hp-field {
+            display: none !important;
+        }
+
+        /* reCAPTCHA Styling */
+        .recaptcha-section {
+            background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+            padding: 30px;
+            border-radius: 16px;
+            border: 2px solid var(--border-color);
+            margin: 35px 0;
+            text-align: center;
+        }
+
+        .recaptcha-title {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: var(--text-dark);
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+
+        .recaptcha-title i {
+            color: var(--primary-red);
+            font-size: 24px;
+        }
+
+        .g-recaptcha {
+            display: inline-block;
+            margin: 0 auto;
+        }
+
+        .recaptcha-note {
+            font-size: 0.85rem;
+            color: var(--text-gray);
+            margin-top: 15px;
+            line-height: 1.5;
         }
 
         /* Fixed ID Photo section alignment and styling */
@@ -1082,6 +1228,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             box-shadow: 0 18px 45px rgba(220, 38, 38, 0.4);
         }
 
+        .btn-submit:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
         .alert {
             padding: 18px 24px;
             border-radius: 12px;
@@ -1297,6 +1450,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             .photo-tab-btn {
                 max-width: none;
             }
+
+            .g-recaptcha {
+                transform: scale(0.85);
+                transform-origin: 0 0;
+            }
         }
     </style>
 </head>
@@ -1334,6 +1492,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         <form method="POST" class="application-form" id="volunteerForm" enctype="multipart/form-data" novalidate>
             <!-- CSRF Token for security -->
             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($_SESSION['csrf_token']); ?>">
+            
+            <!-- Form session token -->
+            <input type="hidden" name="form_token" value="<?php echo htmlspecialchars($current_form_token); ?>">
+            
+            <!-- Honeypot field for spam bots -->
+            <input type="text" name="website" class="hp-field" autocomplete="off">
 
             <!-- Section 1: Personal Information -->
             <div class="form-section">
@@ -1347,12 +1511,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="form-grid">
                     <div class="form-group full-width">
                         <label for="full_name" class="required">Full Name</label>
-                        <input type="text" id="full_name" name="full_name" required>
+                        <input type="text" id="full_name" name="full_name" required maxlength="100">
                     </div>
                     
                     <div class="form-group">
                         <label for="date_of_birth" class="required">Date of Birth</label>
-                        <input type="date" id="date_of_birth" name="date_of_birth" required>
+                        <input type="date" id="date_of_birth" name="date_of_birth" required max="<?php echo date('Y-m-d', strtotime('-18 years')); ?>">
                     </div>
                     
                     <div class="form-group">
@@ -1378,22 +1542,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div class="form-group full-width">
                         <label for="address" class="required">Complete Address</label>
-                        <textarea id="address" name="address" rows="3" required></textarea>
+                        <textarea id="address" name="address" rows="3" required maxlength="500"></textarea>
                     </div>
                     
                     <div class="form-group">
                         <label for="contact_number" class="required">Contact Number</label>
-                        <input type="tel" id="contact_number" name="contact_number" required>
+                        <input type="tel" id="contact_number" name="contact_number" required maxlength="20">
                     </div>
                     
                     <div class="form-group">
                         <label for="email" class="required">Email Address</label>
-                        <input type="email" id="email" name="email" required>
+                        <input type="email" id="email" name="email" required maxlength="100">
                     </div>
                     
                     <div class="form-group">
                         <label for="social_media">Facebook / Social Media</label>
-                        <input type="text" id="social_media" name="social_media">
+                        <input type="text" id="social_media" name="social_media" maxlength="100">
                     </div>
                     
                     <div class="form-group">
@@ -1415,7 +1579,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div class="form-group">
                         <label for="valid_id_number" class="required">ID Number</label>
-                        <input type="text" id="valid_id_number" name="valid_id_number" required>
+                        <input type="text" id="valid_id_number" name="valid_id_number" required maxlength="50">
                     </div>
                 </div>
             </div>
@@ -1619,22 +1783,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="form-grid">
                     <div class="form-group">
                         <label for="emergency_contact_name" class="required">Full Name</label>
-                        <input type="text" id="emergency_contact_name" name="emergency_contact_name" required>
+                        <input type="text" id="emergency_contact_name" name="emergency_contact_name" required maxlength="100">
                     </div>
                     
                     <div class="form-group">
                         <label for="emergency_contact_relationship" class="required">Relationship</label>
-                        <input type="text" id="emergency_contact_relationship" name="emergency_contact_relationship" required>
+                        <input type="text" id="emergency_contact_relationship" name="emergency_contact_relationship" required maxlength="50">
                     </div>
                     
                     <div class="form-group">
                         <label for="emergency_contact_number" class="required">Contact Number</label>
-                        <input type="tel" id="emergency_contact_number" name="emergency_contact_number" required>
+                        <input type="tel" id="emergency_contact_number" name="emergency_contact_number" required maxlength="20">
                     </div>
                     
                     <div class="form-group full-width">
                         <label for="emergency_contact_address" class="required">Address</label>
-                        <textarea id="emergency_contact_address" name="emergency_contact_address" rows="2" required></textarea>
+                        <textarea id="emergency_contact_address" name="emergency_contact_address" rows="2" required maxlength="500"></textarea>
                     </div>
                 </div>
             </div>
@@ -1660,12 +1824,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div class="form-group full-width" id="previous_experience_container" style="display: none;">
                         <label for="previous_volunteer_experience">If yes, where and what was your role?</label>
-                        <textarea id="previous_volunteer_experience" name="previous_volunteer_experience" rows="3"></textarea>
+                        <textarea id="previous_volunteer_experience" name="previous_volunteer_experience" rows="3" maxlength="500"></textarea>
                     </div>
                     
                     <div class="form-group full-width">
                         <label for="volunteer_motivation" class="required">Why do you want to join the Fire and Rescue Volunteer Program?</label>
-                        <textarea id="volunteer_motivation" name="volunteer_motivation" rows="3" required></textarea>
+                        <textarea id="volunteer_motivation" name="volunteer_motivation" rows="3" required minlength="20" maxlength="1000"></textarea>
                     </div>
                     
                     <div class="form-group">
@@ -1679,12 +1843,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div class="form-group" id="occupation_container" style="display: none;">
                         <label for="occupation">Occupation</label>
-                        <input type="text" id="occupation" name="occupation">
+                        <input type="text" id="occupation" name="occupation" maxlength="100">
                     </div>
                     
                     <div class="form-group" id="company_container" style="display: none;">
                         <label for="company">Company</label>
-                        <input type="text" id="company" name="company">
+                        <input type="text" id="company" name="company" maxlength="100">
                     </div>
                 </div>
             </div>
@@ -1724,12 +1888,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div class="form-group full-width">
                         <label for="specialized_training">Specialized Training / Certifications</label>
-                        <textarea id="specialized_training" name="specialized_training" rows="3" placeholder="e.g., BLS, First Aid, Firefighting, Rescue Operations"></textarea>
+                        <textarea id="specialized_training" name="specialized_training" rows="3" placeholder="e.g., BLS, First Aid, Firefighting, Rescue Operations" maxlength="500"></textarea>
                     </div>
                     
                     <div class="form-group full-width">
                         <label for="languages_spoken" class="required">Languages Spoken</label>
-                        <input type="text" id="languages_spoken" name="languages_spoken" required placeholder="e.g., English, Tagalog, Bisaya">
+                        <input type="text" id="languages_spoken" name="languages_spoken" required placeholder="e.g., English, Tagalog, Bisaya" maxlength="100">
                     </div>
                     
                     <div class="form-group full-width">
@@ -1768,7 +1932,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     
                     <div class="form-group full-width" id="driving_license_container" style="display: none;">
                         <label for="driving_license_no">Driving License Number</label>
-                        <input type="text" id="driving_license_no" name="driving_license_no">
+                        <input type="text" id="driving_license_no" name="driving_license_no" maxlength="50">
                     </div>
                 </div>
             </div>
@@ -1882,7 +2046,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
             </div>
 
-            <!-- Section 8: Declaration and Consent -->
+            <!-- Section 8: reCAPTCHA Verification -->
+            <div class="form-section">
+                <div class="recaptcha-section">
+                    <div class="recaptcha-title">
+                        <i class="fas fa-shield-alt"></i>
+                        Security Verification
+                    </div>
+                    <div class="g-recaptcha" data-sitekey="<?php echo RECAPTCHA_SITE_KEY; ?>"></div>
+                    <div class="recaptcha-note">
+                        <i class="fas fa-info-circle"></i>
+                        Please complete the reCAPTCHA to verify you're not a robot
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 9: Declaration and Consent -->
             <div class="form-section">
                 <div class="section-header">
                     <div class="section-icon">
@@ -1901,7 +2080,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         <div class="form-group full-width">
                             <label for="signature" class="required">Signature of Applicant (Type your full name)</label>
                             <div class="signature-input-wrapper">
-                                <input type="text" id="signature" name="signature" class="signature-input" placeholder="Enter your full name as signature" required>
+                                <input type="text" id="signature" name="signature" class="signature-input" placeholder="Enter your full name as signature" required maxlength="100">
                             </div>
                             <div class="signature-hint">
                                 <i class="fas fa-info-circle"></i>
@@ -1926,7 +2105,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             <!-- Submit Section -->
             <div class="submit-section">
-                <button type="submit" class="btn-submit">
+                <button type="submit" class="btn-submit" id="submitBtn">
                     <i class="fas fa-paper-plane"></i>
                     Submit Application
                 </button>
@@ -2196,33 +2375,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             document.getElementById('driving_license_container').style.display = this.checked ? 'block' : 'none';
         });
 
+        // Age validation
+        document.getElementById('date_of_birth').addEventListener('change', function() {
+            const dob = new Date(this.value);
+            const today = new Date();
+            const age = today.getFullYear() - dob.getFullYear();
+            const monthDiff = today.getMonth() - dob.getMonth();
+            
+            if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < dob.getDate())) {
+                age--;
+            }
+            
+            if (age < 18) {
+                alert('You must be at least 18 years old to volunteer.');
+                this.value = '';
+            }
+        });
+
+        // Signature validation
+        document.getElementById('signature').addEventListener('input', function() {
+            const fullName = document.getElementById('full_name').value;
+            const signature = this.value;
+            
+            if (fullName && signature && fullName !== signature) {
+                this.style.borderColor = 'var(--primary-red)';
+                this.style.backgroundColor = 'var(--primary-red-light)';
+            } else {
+                this.style.borderColor = '';
+                this.style.backgroundColor = '';
+            }
+        });
+
+        // Form submission handler
         document.getElementById('volunteerForm').addEventListener('submit', function(e) {
+            const submitBtn = document.getElementById('submitBtn');
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Processing...';
+
+            // Basic validation
             const declaration = document.getElementById('declaration_agreed');
             if (!declaration.checked) {
                 e.preventDefault();
                 alert('Please agree to the declaration and consent terms.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
                 return false;
             }
 
             const daysChecked = document.querySelectorAll('input[name="available_days[]"]:checked').length;
             const hoursChecked = document.querySelectorAll('input[name="available_hours[]"]:checked').length;
             const signature = document.getElementById('signature').value;
+            const fullName = document.getElementById('full_name').value;
             
             if (daysChecked === 0) {
                 e.preventDefault();
                 alert('Please select at least one available day.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
                 return false;
             }
             
             if (hoursChecked === 0) {
                 e.preventDefault();
                 alert('Please select at least one available time period.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
                 return false;
             }
 
             if (!signature) {
                 e.preventDefault();
                 alert('Please provide your signature by typing your full name.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
+                return false;
+            }
+
+            if (signature !== fullName) {
+                e.preventDefault();
+                alert('Signature must match your full name exactly.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
                 return false;
             }
 
@@ -2232,14 +2465,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!idFrontInput.files.length) {
                 e.preventDefault();
                 alert('Please upload your ID front photo.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
                 return false;
             }
 
             if (!idBackInput.files.length) {
                 e.preventDefault();
                 alert('Please upload your ID back photo.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
                 return false;
             }
+
+            // Check reCAPTCHA
+            const recaptchaResponse = grecaptcha.getResponse();
+            if (!recaptchaResponse) {
+                e.preventDefault();
+                alert('Please complete the reCAPTCHA verification.');
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = '<i class="fas fa-paper-plane"></i> Submit Application';
+                return false;
+            }
+
+            return true;
         });
 
         <?php if ($show_redirect): ?>
